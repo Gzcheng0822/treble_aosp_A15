@@ -1,0 +1,4 @@
+# 自动生成 patch.list，请根据需要注释掉不想应用的目录
+
+# 补丁类型：trebledroid
+trebledroid/platform_bionic
