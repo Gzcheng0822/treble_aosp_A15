@@ -3,15 +3,14 @@ set -e
 
 # 目录设定
 MAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-WORK_DIR="/root/aosp"
-SOURCE_ROOT="$WORK_DIR/projects"
-BUILD_ROOT="$WORK_DIR/treble_aosp"
-OUTPUT_DIR="$WORK_DIR/output"
-PATCH_SH="$BUILD_ROOT/patch_quite.sh"
+REPO_PATH="$MAIN_DIR/repo"
+PROJECT_MAIN_PATH="$MAIN_DIR/projects"
+BUILD_PATH="$MAIN_DIR/treble_aosp"
+PATCH_SH="$MAIN_DIR/patch.sh"
+PROJECTS_PATH=""
 
 # 日志记录
-log_file="$BUILD_ROOT/build_$(date +%Y%m%d_%H%M%S).log"
+log_file="$MAIN_DIR/log_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee "$log_file") 2>&1
 
 # 处理命令行参数
@@ -32,9 +31,6 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
-export BUILD_NUMBER="$(date +%y%m%d)"
-START=$(date +%s)
-
 # 检查目录
 checkPaths() {
     echo "--> 检查必要目录和文件是否存在..."
@@ -43,11 +39,9 @@ checkPaths() {
 
     # 必要目录
     local dirs=(
-        "$WORK_DIR"
-        "$SOURCE_ROOT"
-        "$BUILD_ROOT"
-        "$OUTPUT_DIR"
-        "$BUILD_ROOT/build"
+        "$MAIN_DIR"
+		"$REPO_PATH"
+        "$PROJECT_MAIN_PATH"
     )
 
     for dir in "${dirs[@]}"; do
@@ -56,8 +50,8 @@ checkPaths() {
 
     # 必要文件
     local files=(
-        "$BUILD_ROOT/build/default.xml"
-        "$BUILD_ROOT/build/remove.xml"
+        "$BUILD_PATH/build/default.xml"
+        "$BUILD_PATH/build/remove.xml"
         "$PATCH_SH"
     )
 
@@ -122,16 +116,27 @@ check_java11() {
     echo
 }
 
-fixGappsLfs() {
-    echo "--> 确保 GApps APK LFS 内容完整"
-    pushd "$SOURCE_ROOT/vendor/gapps/common" >/dev/null
-    git lfs install
-    git lfs pull
-    git lfs checkout
-    popd >/dev/null
+# 检查最终 zip 是否已存在
+checkFinalZIP() {
+    local final_zip_dir="$MAIN_DIR/zip"
+
+    if ls "$final_zip_dir"/*.zip >/dev/null 2>&1; then
+        echo "已检测到存在已构建的 zip 文件：$final_zip_dir"
+        read -p "是否重新编译？(y/N): " confirm
+        case "$confirm" in
+            [yY]|[yY][eE][sS])
+                echo "继续执行编译流程..."
+                ;;
+            *)
+                echo "跳过构建流程。"
+                exit 0
+                ;;
+        esac
+    fi
 }
 
-# 磁盘空间检查
+
+# 检查磁盘空间
 checkDiskSpace() {
     echo "--> 磁盘空间检查"
 
@@ -140,179 +145,380 @@ checkDiskSpace() {
         echo -e "\n磁盘空间不足（当前：$(df -h . | awk 'NR==2 {print $4}')）"
         exit 1
     fi
-    echo "检查通过"
+    echo "剩余磁盘空间为$(df -h . | awk 'NR==2 {print $4}') 检查通过"
     echo
 }
 
-cleanVendorPoncesPriv() {
-    local xml="$BUILD_ROOT/build/default.xml"
-    if grep -q "ponces/vendor_ponces-priv" "$xml"; then
-        echo "清理 default.xml 中的 vendor_ponces-priv 项"
-        sed -i '/ponces\/vendor_ponces-priv/d' "$xml"
-    fi
-}
+# 初始化 repo
+initMainRepo() {
+    echo "--> 初始化主 repo 仓库（路径: $REPO_PATH）"
 
-initRepos() {
-    echo "--> 初始化 repo"
-    cd "$SOURCE_ROOT"
-    if [ ! -d .repo ]; then
-        repo init -u https://android.googlesource.com/platform/manifest -b android-15.0.0_r36 --depth=1 --config-name
+    # 先确保 REPO_PATH 目录存在
+    if [ ! -d "$REPO_PATH" ]; then
+        mkdir -p "$REPO_PATH"
     fi
-    mkdir -p .repo/local_manifests
-    cp -f "$BUILD_ROOT/build/default.xml" .repo/local_manifests/default.xml
-    cp -f "$BUILD_ROOT/build/remove.xml" .repo/local_manifests/remove.xml
-    cd "$WORK_DIR"
+
+    # 再进入目录
+    cd "$REPO_PATH"
+
+    # 检查 .repo 是否已存在，避免重复 init
+    if [ ! -d ".repo" ]; then
+        echo "执行 repo init..."
+        repo init -u https://android.googlesource.com/platform/manifest \
+                  -b android-15.0.0_r36 \
+                  --git-lfs --config-name
+
+        mkdir -p .repo/local_manifests
+        cp -f "$BUILD_PATH/build/default.xml" .repo/local_manifests/default.xml
+        cp -f "$BUILD_PATH/build/remove.xml" .repo/local_manifests/remove.xml
+    else
+        echo "✅ 主 repo 已存在，跳过初始化"
+    fi
+
     echo
 }
 
-syncRepos() {
-    echo "--> 同步源码"
-    cd "$SOURCE_ROOT"
-    for jobs in 32 16 8; do
-        echo "尝试 repo sync -j$jobs..."
-        if repo sync -c --no-clone-bundle --no-tags -j$jobs; then
-            echo "同步成功"
-            break
+# 项目选择器
+chooseProjectBuild() {
+    echo "--> 选择项目子目录进行构建"
+    mkdir -p "$PROJECT_MAIN_PATH"
+    echo "当前可用项目目录："
+    find "$PROJECT_MAIN_PATH" -maxdepth 1 -mindepth 1 -type d | sed "s|^$PROJECT_MAIN_PATH/|- |"
+    echo
+
+    read -p "请输入你要使用或创建的项目目录名（如 vanilla, patched): " subdir
+    subdir=$(echo "$subdir" | tr -cd '[:alnum:]_-')
+    [[ -z "$subdir" ]] && { echo "[错误] 子目录名不能为空！"; exit 1; }
+
+    PROJECTS_PATH="$PROJECT_MAIN_PATH/$subdir"
+
+    if [ ! -d "$PROJECTS_PATH" ]; then
+        echo "创建项目目录：$PROJECTS_PATH"
+        rsync -a --exclude='.repo' "$REPO_PATH/" "$PROJECTS_PATH/"
+    else
+        echo "使用已有项目目录：$PROJECTS_PATH"
+        read -p "是否重新覆盖主 repo 源码到此目录？(y/N): " replace_confirm
+        if [[ "$replace_confirm" =~ ^[yY]$ ]]; then
+            echo "→ 正在重新复制主 repo 内容…"
+            rsync -a --delete --exclude='.repo' "$REPO_PATH/" "$PROJECTS_PATH/"
         fi
-        sleep 10
+    fi
+
+    # —— 验证关键文件，必要时自动重复制 —— #
+    if [ ! -f "$PROJECTS_PATH/build/envsetup.sh" ]; then
+        echo "⚠️ 缺失 build/envsetup.sh，自动重新复制源码…"
+        rsync -a --delete --exclude='.repo' "$REPO_PATH/" "$PROJECTS_PATH/"
+        echo "✅ 复制完成"
+    fi
+
+    echo
+}
+
+
+# 检查 主repo状态
+doMainRepo() {
+    echo "--> 检查主 repo 状态完整性..."
+
+    local need_init=false
+    local need_sync=false
+
+    # ===== 检查是否已初始化 .repo =====
+    if [ ! -d "$REPO_PATH/.repo" ]; then
+        echo "⚠️ 未发现 .repo 目录，尚未 init"
+        need_init=true
+    fi
+
+    # ===== 执行初始化 =====
+    if [ "$need_init" = true ]; then
+        echo "→ 初始化主 repo..."
+        initMainRepo
+    fi
+
+    # ===== 检查关键目录完整性 =====
+    echo "→ 检查关键目录完整性..."
+    local critical_paths=(
+        "$REPO_PATH/build/envsetup.sh"
+        "$REPO_PATH/prebuilts/go/linux-x86/bin/go"
+        "$REPO_PATH/frameworks/base"
+        "$REPO_PATH/system/core"
+        "$REPO_PATH/device"
+        "$REPO_PATH/hardware"
+        "$REPO_PATH/external"
+    )
+
+    local missing_critical=0
+    for path in "${critical_paths[@]}"; do
+        if [ ! -e "$path" ]; then
+            echo "❌ 缺失关键路径: $path"
+            missing_critical=$((missing_critical + 1))
+        fi
     done
-    cd "$WORK_DIR"
+    [ "$missing_critical" -gt 0 ] && need_sync=true
+
+    # ===== 检查所有项目 Git 仓库和源码目录 =====
+    echo "→ 检查所有项目 Git 仓库与源码目录..."
+    local missing_git=0
+    local missing_checkout=0
+    local total_checked=0
+
+    cd "$REPO_PATH" || exit 1
+    while IFS= read -r proj; do
+        proj_path="$REPO_PATH/$proj"
+        proj_git="$REPO_PATH/.repo/projects/$proj.git"
+
+        [ ! -d "$proj_git" ] && {
+            echo "❌ Git 仓库缺失: $proj_git"
+            missing_git=$((missing_git + 1))
+        }
+
+        [ ! -d "$proj_path" ] && {
+            echo "⚠️ 源码目录缺失: $proj_path"
+            missing_checkout=$((missing_checkout + 1))
+        }
+
+        total_checked=$((total_checked + 1))
+    done < <(repo list -p)
+
+    echo "→ 已检查 $total_checked 个项目："
+    echo "   - 缺失 Git 仓库：$missing_git"
+    echo "   - 缺失源码目录：$missing_checkout"
+
+    if [ "$missing_git" -gt 0 ] || [ "$missing_checkout" -gt 0 ]; then
+        need_sync=true
+    fi
+
+    # ===== 用户交互：是否同步 =====
+    if [ "$need_sync" = true ]; then
+        echo "⚠️ 主 repo 不完整。"
+
+        echo "你可以选择以下操作："
+        echo "  [y] 重新同步 repo"
+        echo "  [s] 跳过此步（不推荐）"
+        echo "  [n] 退出脚本"
+        echo -n "你的选择 (y/s/n): "
+        read -r decision
+
+        case "$decision" in
+            [yY])
+                echo "→ 正在重新同步主 repo..."
+                syncMainRepo
+                ;;
+            [sS])
+                echo "→ 跳过同步（注意：构建可能失败）"
+                ;;
+            *)
+                echo "→ 用户选择退出脚本"
+                exit 1
+                ;;
+        esac
+    else
+        echo "✅ 主 repo 完整性检查通过"
+    fi
+
     echo
 }
 
+
+
+
+syncMainRepo() {
+    echo "--> 同步主 repo 源码：$REPO_PATH"
+    cd "$REPO_PATH"
+
+    local max_attempts=3
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        echo "尝试 repo sync -j16...（第 $attempt 次）"
+        if repo sync -c --no-clone-bundle --no-tags -j16; then
+            echo "✅ 主 repo 同步成功"
+            return 0
+        else
+            echo "⚠️ 第 $attempt 次同步失败"
+            sleep 10
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    echo "❌ 连续 $max_attempts 次同步失败，可能是网络或远程仓库问题。"
+    echo "请检查网络连接或尝试更换镜像。"
+    echo "是否重试同步？(y 重试 / n 退出 / s 跳过)"
+    read -r choice
+    case "$choice" in
+        [yY])
+            syncMainRepo  # 递归调用重试
+            ;;
+        [sS])
+            echo "⚠️ 跳过同步，后续可能构建失败。"
+            ;;
+        *)
+            echo "退出脚本。"
+            exit 1
+            ;;
+    esac
+}
+
+
+
+# 应用补丁
 applyPatches() {
+    echo "--> 准备应用补丁"
+
+    local patch_flag="$PROJECTS_PATH/.patch_applied"
+
+    if [ -f "$patch_flag" ]; then
+        echo "检测到补丁已应用，跳过此步骤。"
+        return
+    fi
+
+    read -p "是否应用补丁？(Y/n): " confirm
+    case "$confirm" in
+        [nN]|[nN][oO])
+            echo "用户选择跳过补丁。"
+            return
+            ;;
+    esac
+
     echo "--> 应用补丁"
-    bash "$PATCH_SH" "$BUILD_ROOT" trebledroid
-    bash "$PATCH_SH" "$BUILD_ROOT" personal
-    cd "$SOURCE_ROOT/device/phh/treble"
-    cp "$BUILD_ROOT/build/aosp.mk" .
+    bash "$PATCH_SH" "$BUILD_PATH" trebledroid
+    bash "$PATCH_SH" "$BUILD_PATH" personal
+
+    cd "$PROJECTS_PATH/device/phh/treble" || exit 1
+    cp "$BUILD_PATH/build/aosp.mk" .
     bash generate.sh aosp
-    cd "$WORK_DIR"
+    cd "$MAIN_DIR"
+
+    # 标记补丁已完成
+    touch "$patch_flag"
+    echo "补丁已应用完成。"
     echo
 }
 
-setupEnv() {
-    echo "--> 设置构建环境"
-    cd "$SOURCE_ROOT"
-    source build/envsetup.sh
-
+# 配置ccache
+configureCcache() {
     echo "启用 ccache"
     export USE_CCACHE=1
     export CCACHE_EXEC=$(command -v ccache)
 
-    export CCACHE_DIR=$SOURCE_ROOT/out/.ccache
+    export CCACHE_DIR=$PROJECTS_PATH/.ccache
     export CCACHE_TEMPDIR=$CCACHE_DIR/tmp
     mkdir -p "$CCACHE_TEMPDIR"
 
-    export CC="ccache /root/aosp/projects/prebuilts/clang/host/linux-x86/clang-r536225/bin/clang"
-    export CXX="ccache /root/aosp/projects/prebuilts/clang/host/linux-x86/clang-r536225/bin/clang++"
+    export CC="ccache $PROJECTS_PATH/prebuilts/clang/host/linux-x86/clang-r536225/bin/clang"
+    export CXX="ccache $PROJECTS_PATH/prebuilts/clang/host/linux-x86/clang-r536225/bin/clang++"
 
-    echo "设置 ccache 缓存上限为 200G..."
-    ccache -M 200G || true
+    ccache -M 200G > /dev/null 2>&1 || true
 
-    echo "CC=$CC"
-    echo "CXX=$CXX"
-    echo "CCACHE_DIR=$CCACHE_DIR"
-    ccache -p | grep dir
+    echo "当前 ccache 路径为：$CCACHE_DIR，已成功启用。"
+}
 
-    mkdir -p "$OUTPUT_DIR"
-    cd "$WORK_DIR"
+
+# 设置环境
+setupEnv() {
+    echo "--> 设置构建环境"
+    cd "$PROJECTS_PATH"
+    source build/envsetup.sh
+	
+	configureCcache
+
     echo
 }
 
-zipalignGapps() {
-    echo "--> zipalign 所有 GApps APK"
-    local count=0
-    local apk_list
-    apk_list=$(find projects/vendor/gapps/common/proprietary -name "*.apk")
-    echo "找到以下 APK："
-    echo "$apk_list"
-
-    while IFS= read -r apk; do
-        if file "$apk" | grep -qv 'Zip archive\|Java archive'; then
-            echo "跳过无效 APK：$apk"
-            continue
-        fi
-        if ! zipalign -c -p 4 "$apk" &>/dev/null; then
-            if zipalign -p -f 4 "$apk" "$apk.aligned" 2>/dev/null; then
-                mv "$apk.aligned" "$apk"
-                echo "zipaligned: $apk"
-                ((count++))
-            else
-                echo "zipalign 失败: $apk"
-            fi
-        fi
-    done <<< "$apk_list"
-
-    echo "共处理 $count 个 APK"
-    echo
-}
-
-buildTrebleApp() {
-    echo "--> 编译 TrebleApp"
-    cd "$SOURCE_ROOT/treble_app"
-    bash build.sh release
-    cp TrebleApp.apk "$SOURCE_ROOT/vendor/hardware_overlay/TrebleApp/app.apk"
-    cd "$WORK_DIR"
-    echo
-}
-
-buildVariant() {
+# 编译配置
+buildSystemImg() {
     echo "--> 编译 $1"
-    cd "$SOURCE_ROOT"
-
-    output_img="$OUTPUT_DIR/system-$1.img"
-    if [[ -f "$output_img" ]]; then
-        echo "检测到已构建镜像 $output_img，跳过构建"
-        return
-    fi
+    cd "$PROJECTS_PATH"
 
     lunch "$1"-bp1a-userdebug
     make -j$(nproc) installclean
     make -j$(nproc) systemimage
     make -j$(nproc) target-files-package otatools
-
-    img_source="$OUT/target/product/tdgsi_arm64_ab/obj/PACKAGING/system_intermediates/system.img"
-    if [[ ! -f "$img_source" ]]; then
-        echo "未找到系统镜像 $img_source"
-        exit 1
-    fi
-
-    cp "$img_source" "$output_img"
-    echo "导出系统镜像为 $output_img"
-
-    cd "$WORK_DIR"
+	
+    cd "$MAIN_DIR"
     echo
 }
 
+# 编译系统变种
 buildVariants() {
     if [[ "$VARIANT_VANILLA" == true ]]; then
         echo "编译 Vanilla + GApps 两个版本"
-        buildVariant treble_arm64_bvN
-        buildVariant treble_arm64_bgN
+        buildSystemImg treble_arm64_bvN
+        buildSystemImg treble_arm64_bgN
     else
         echo "仅编译 GApps 版本"
-        buildVariant treble_arm64_bgN
+        buildSystemImg treble_arm64_bgN
     fi
 }
 
+# 移动并重命名已构建的 .zip 镜像
+collectFinalZIP() {
+	local search_root="$PROJECTS_PATH/out/target/product/tdgsi_arm64_ab/obj/PACKAGING/target_files_intermediates"
+    if [ ! -d "$search_root" ]; then
+		echo "⚠️ 构建输出目录未找到：$search_root"
+		return 1
+	fi
+    local dest_dir="$MAIN_DIR/zip"
+    local timestamp
+    local zip_list
+
+    echo "正在扫描 $search_root 目录以查找 .zip 文件..."
+
+    zip_list=$(find "$search_root" -type f -name "*.zip" 2>/dev/null)
+
+    if [ -z "$zip_list" ]; then
+        echo "未找到任何 .zip 文件。"
+        return 1
+    fi
+
+    mkdir -p "$dest_dir"
+    timestamp=$(date "+%Y%m%d_%H%M%S")
+
+    while IFS= read -r zip_file; do
+        [ -z "$zip_file" ] && continue
+
+        local base_name new_name dest_zip
+        base_name=$(basename "$zip_file")
+        new_name="${base_name%.*}_$timestamp.zip"
+        dest_zip="$dest_dir/$new_name"
+
+        echo "移动 $zip_file 到 $dest_zip"
+        mv "$zip_file" "$dest_zip"
+    done <<< "$zip_list"
+
+    echo "所有 zip 文件已成功移动到: $dest_dir"
+}
+
+# 开始计时
+export BUILD_NUMBER="$(date +%y%m%d)"
+START=$(date +%s)
 # ========== 主流程 ==========
+export BUILD_NUMBER="$(date +%y%m%d)"
+START=$(date +%s)
 echo "--------------------------------------"
 echo "       AOSP 15.0 自动编译脚本（v10）     "
 echo "          Modified By Gzcheng         "
 echo "--------------------------------------"
 
-# 
-
-# 检查目录
+# 检查
 checkPaths
-# 检查软件包
 checkSystemPackage
-# 检查 Java_11
 check_java11
-# 磁盘空间检查
+checkFinalZIP
 checkDiskSpace
 
+# 检查主repo, 如果不存在或者不完整则初始化
+doMainRepo
+
+# 选择子项目
+chooseProjectBuild    
+#应用补丁
+applyPatches
+# 设置构建环境
+setupEnv
+# 开始编译系统
+buildVariants
+# 移动镜像
+collectFinalZIP
 
 END=$(date +%s)
 ELAPSED=$((END - START))

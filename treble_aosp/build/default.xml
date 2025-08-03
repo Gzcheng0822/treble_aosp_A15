@@ -20,5 +20,6 @@
   <project path="vendor/hardware_overlay" name="TrebleDroid/vendor_hardware_overlay" remote="github" revision="pie" />
   <project path="vendor/interfaces" name="TrebleDroid/vendor_interfaces" remote="github" revision="android-15.0" />
   <project path="vendor/magisk" name="phhusson/vendor_magisk" remote="github" revision="android-10.0" />
+  <project path="vendor/ponces-priv" name="ponces/vendor_ponces-priv" remote="private" revision="android-15.0" />
   <project path="vendor/ponces" name="ponces/vendor_ponces" remote="github" revision="android-15.0" />
 </manifest>
